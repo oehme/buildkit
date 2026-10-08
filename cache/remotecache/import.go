@@ -18,6 +18,7 @@ import (
 	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/imageutil"
 	"github.com/moby/buildkit/util/progress"
+	"github.com/moby/buildkit/util/tracing"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -100,12 +101,14 @@ func (ci *contentCacheImporter) Resolve(ctx context.Context, desc ocispecs.Descr
 	}
 
 	if dsls, ok := ci.provider.(DistributionSourceLabelSetter); ok {
+		span, labelCtx := tracing.StartSpan(ctx, fmt.Sprintf("setting distribution source labels for %d layers", len(allLayers)))
 		for dgst, l := range allLayers {
-			err := dsls.SetDistributionSourceLabel(ctx, dgst)
+			err := dsls.SetDistributionSourceLabel(labelCtx, dgst)
 			_ = err // error ignored because layer may not exist
 			l.Descriptor = dsls.SetDistributionSourceAnnotation(l.Descriptor)
 			allLayers[dgst] = l
 		}
+		span.End()
 	}
 
 	if configDesc.Digest == "" {
@@ -117,6 +120,13 @@ func (ci *contentCacheImporter) Resolve(ctx context.Context, desc ocispecs.Descr
 		return nil, err
 	}
 
+	span, ctx := tracing.StartSpan(ctx, fmt.Sprintf("parsing cache config of %d bytes", len(dt)))
+	cm, err := parseCacheConfig(ctx, dt, allLayers, id, w)
+	tracing.FinishWithError(span, err)
+	return cm, err
+}
+
+func parseCacheConfig(ctx context.Context, dt []byte, allLayers v1.DescriptorProvider, id string, w worker.Worker) (solver.CacheManager, error) {
 	cc := v1.NewCacheChains()
 	if err := v1.Parse(dt, allLayers, cc); err != nil {
 		return nil, err

@@ -74,6 +74,7 @@ import (
 	"github.com/urfave/cli/v3"
 	bolt "go.etcd.io/bbolt"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/metric"
@@ -347,6 +348,7 @@ func main() {
 		if err != nil {
 			return err
 		}
+		otel.SetTracerProvider(tp)
 		closers = append(closers, tp.Shutdown)
 
 		mp, err := newMeterProvider(ctx)
