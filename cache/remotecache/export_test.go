@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/containerd/containerd/v2/core/content"
 	cacheimporttypes "github.com/moby/buildkit/cache/remotecache/v1/types"
@@ -54,4 +56,63 @@ func TestImportReadsEmbeddedConfig(t *testing.T) {
 	provider, mfstDesc = manifestWithConfig(configDescriptor(config, false))
 	_, err = NewImporter(provider).Resolve(ctx, mfstDesc, "referenced", nil)
 	require.Error(t, err, "without embedded data the config blob has to be fetched")
+}
+
+// gatedLabelSetter blocks every label write until released.
+type gatedLabelSetter struct {
+	content.Provider
+	release chan struct{}
+	labeled atomic.Int64
+}
+
+func (g *gatedLabelSetter) SetDistributionSourceLabel(ctx context.Context, _ digest.Digest) error {
+	select {
+	case <-g.release:
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	}
+	g.labeled.Add(1)
+	return nil
+}
+
+func (g *gatedLabelSetter) SetDistributionSourceAnnotation(desc ocispecs.Descriptor) ocispecs.Descriptor {
+	return desc
+}
+
+// The import must not wait for the distribution source labels of the layers
+// to be written, but they must be written eventually.
+func TestImportDoesNotWaitForDistributionSourceLabels(t *testing.T) {
+	ctx := context.Background()
+	config := []byte(`{"layers":[],"records":[]}`)
+	layers := []ocispecs.Descriptor{
+		{MediaType: ocispecs.MediaTypeImageLayerGzip, Digest: digest.FromString("layer-1"), Size: 1},
+		{MediaType: ocispecs.MediaTypeImageLayerGzip, Digest: digest.FromString("layer-2"), Size: 1},
+	}
+	dt, err := json.Marshal(ocispecs.Manifest{
+		MediaType: ocispecs.MediaTypeImageManifest,
+		Config:    configDescriptor(config, true),
+		Layers:    layers,
+	})
+	require.NoError(t, err)
+	mfstDesc := ocispecs.Descriptor{MediaType: ocispecs.MediaTypeImageManifest, Digest: digest.FromBytes(dt), Size: int64(len(dt))}
+	buf := contentutil.NewBuffer()
+	require.NoError(t, content.WriteBlob(ctx, buf, "manifest", bytes.NewReader(dt), mfstDesc))
+
+	provider := &gatedLabelSetter{Provider: buf, release: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		_, err := NewImporter(provider).Resolve(ctx, mfstDesc, "gated", nil)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		close(provider.release)
+		t.Fatal("import waited for the distribution source labels")
+	}
+	require.Equal(t, int64(0), provider.labeled.Load())
+
+	close(provider.release)
+	require.Eventually(t, func() bool { return provider.labeled.Load() == int64(len(layers)) }, 10*time.Second, 10*time.Millisecond)
 }

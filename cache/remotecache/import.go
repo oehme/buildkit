@@ -101,14 +101,13 @@ func (ci *contentCacheImporter) Resolve(ctx context.Context, desc ocispecs.Descr
 	}
 
 	if dsls, ok := ci.provider.(DistributionSourceLabelSetter); ok {
-		span, labelCtx := tracing.StartSpan(ctx, fmt.Sprintf("setting distribution source labels for %d layers", len(allLayers)))
+		digests := make([]digest.Digest, 0, len(allLayers))
 		for dgst, l := range allLayers {
-			err := dsls.SetDistributionSourceLabel(labelCtx, dgst)
-			_ = err // error ignored because layer may not exist
 			l.Descriptor = dsls.SetDistributionSourceAnnotation(l.Descriptor)
 			allLayers[dgst] = l
+			digests = append(digests, dgst)
 		}
-		span.End()
+		labelDistributionSource(ctx, dsls, digests)
 	}
 
 	if configDesc.Digest == "" {
@@ -137,6 +136,22 @@ func parseCacheConfig(ctx context.Context, dt []byte, allLayers v1.DescriptorPro
 		return nil, err
 	}
 	return solver.NewCacheManager(ctx, id, keysStorage, resultStorage), nil
+}
+
+// labelDistributionSource records on the layers that are present locally which
+// registry they are also available from, so that pushing them there can mount
+// them instead of uploading. Layers that are not present can not be labeled
+// and are skipped. Nothing in the import depends on the labels, so they are
+// written in the background.
+func labelDistributionSource(ctx context.Context, dsls DistributionSourceLabelSetter, digests []digest.Digest) {
+	ctx = context.WithoutCancel(ctx)
+	go func() {
+		span, ctx := tracing.StartSpan(ctx, fmt.Sprintf("setting distribution source labels for %d layers", len(digests)))
+		defer span.End()
+		for _, dgst := range digests {
+			_ = dsls.SetDistributionSourceLabel(ctx, dgst)
+		}
+	}()
 }
 
 func readBlob(ctx context.Context, provider content.Provider, desc ocispecs.Descriptor) ([]byte, error) {
@@ -185,11 +200,12 @@ func (ci *contentCacheImporter) importInlineCache(ctx context.Context, dt []byte
 				}
 
 				if dsls, ok := ci.provider.(DistributionSourceLabelSetter); ok {
+					digests := make([]digest.Digest, 0, len(m.Layers))
 					for i, l := range m.Layers {
-						err := dsls.SetDistributionSourceLabel(ctx, l.Digest)
-						_ = err // error ignored because layer may not exist
 						m.Layers[i] = dsls.SetDistributionSourceAnnotation(l)
+						digests = append(digests, l.Digest)
 					}
+					labelDistributionSource(ctx, dsls, digests)
 				}
 
 				p, err := content.ReadBlob(ctx, ci.provider, m.Config)
