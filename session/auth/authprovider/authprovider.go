@@ -35,7 +35,6 @@ import (
 )
 
 const (
-	defaultExpiration      = 60
 	DockerHubConfigfileKey = "https://index.docker.io/v1/"
 	DockerHubRegistryHost  = "registry-1.docker.io"
 )
@@ -311,9 +310,6 @@ func (ap *authProvider) getAuthorityKey(ctx context.Context, host string, salt [
 }
 
 func toTokenResponse(token string, issuedAt time.Time, expires int) *auth.FetchTokenResponse {
-	if expires == 0 {
-		expires = defaultExpiration
-	}
 	resp := &auth.FetchTokenResponse{
 		Token:     token,
 		ExpiresIn: int64(expires),

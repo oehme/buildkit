@@ -3,6 +3,7 @@ package resolver
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"maps"
@@ -27,6 +28,8 @@ import (
 	"github.com/moby/buildkit/version"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const defaultExpiration = 60
@@ -338,13 +341,10 @@ func (ah *authFetcher) fetchToken(ctx context.Context, sm *session.Manager, g se
 	var expires int
 	var token string
 	defer func() {
-		token = fmt.Sprintf("Bearer %s", token)
-
 		if err == nil {
-			r = &authResult{token: token}
-			if issuedAt.IsZero() {
-				issuedAt = time.Now()
-			}
+			r = &authResult{token: fmt.Sprintf("Bearer %s", token)}
+			issuedAt, expires = tokenLifetime(token, issuedAt, expires)
+			trace.SpanFromContext(ctx).SetAttributes(attribute.Int("registry.token.lifetime_seconds", expires))
 			if exp := issuedAt.Add(time.Duration(float64(expires)*0.9) * time.Second); time.Now().Before(exp) {
 				r.expires = exp
 			}
@@ -361,9 +361,6 @@ func (ah *authFetcher) fetchToken(ctx context.Context, sm *session.Manager, g se
 		}, sm, g)
 		if err != nil {
 			return nil, err
-		}
-		if resp.ExpiresIn == 0 {
-			resp.ExpiresIn = defaultExpiration
 		}
 		expires = int(resp.ExpiresIn)
 		// We later check issuedAt.isZero, which would return
@@ -404,9 +401,6 @@ func (ah *authFetcher) fetchToken(ctx context.Context, sm *session.Manager, g se
 					if err != nil {
 						return nil, err
 					}
-					if resp.ExpiresInSeconds == 0 {
-						resp.ExpiresInSeconds = defaultExpiration
-					}
 					issuedAt, expires = resp.IssuedAt, resp.ExpiresInSeconds
 					token = resp.AccessToken
 					return nil, nil
@@ -417,9 +411,6 @@ func (ah *authFetcher) fetchToken(ctx context.Context, sm *session.Manager, g se
 				}).Debugf("token request failed")
 			}
 			return nil, err
-		}
-		if resp.ExpiresInSeconds == 0 {
-			resp.ExpiresInSeconds = defaultExpiration
 		}
 		issuedAt, expires = resp.IssuedAt, resp.ExpiresInSeconds
 		token = resp.Token
@@ -432,9 +423,6 @@ func (ah *authFetcher) fetchToken(ctx context.Context, sm *session.Manager, g se
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to fetch anonymous token")
 	}
-	if resp.ExpiresInSeconds == 0 {
-		resp.ExpiresInSeconds = defaultExpiration
-	}
 	issuedAt, expires = resp.IssuedAt, resp.ExpiresInSeconds
 
 	token = resp.Token
@@ -445,6 +433,57 @@ func (ah *authFetcher) fetchToken(ctx context.Context, sm *session.Manager, g se
 // on the final registry host. Earlier hosts fall through to the next host.
 // Retrying those errors here would multiply the final host's attempts and
 // backoff. Connection resets and token 5xx responses still need a retry here.
+
+// tokenLifetime returns when a token was issued and for how many seconds it is
+// valid. The expiry claimed by a JWT token is authoritative, as that is what
+// the registry enforces, and clients may have substituted a default for a
+// lifetime the registry did not declare. Other tokens last as long as the
+// response declares, or defaultExpiration seconds when it does not.
+func tokenLifetime(token string, issuedAt time.Time, expiresIn int) (time.Time, int) {
+	if exp, iat, ok := jwtValidity(token); ok {
+		if issuedAt.IsZero() {
+			issuedAt = iat
+		}
+		if issuedAt.IsZero() {
+			issuedAt = time.Now()
+		}
+		if lifetime := int(exp.Sub(issuedAt).Seconds()); lifetime > 0 {
+			return issuedAt, lifetime
+		}
+	}
+	if issuedAt.IsZero() {
+		issuedAt = time.Now()
+	}
+	if expiresIn == 0 {
+		expiresIn = defaultExpiration
+	}
+	return issuedAt, expiresIn
+}
+
+// jwtValidity returns the expiry and the issue time claimed by a JWT token.
+// The issue time is zero when the token does not claim one.
+func jwtValidity(token string) (exp, iat time.Time, ok bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return time.Time{}, time.Time{}, false
+	}
+	dt, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return time.Time{}, time.Time{}, false
+	}
+	var claims struct {
+		Exp float64 `json:"exp"`
+		Iat float64 `json:"iat"`
+	}
+	if err := json.Unmarshal(dt, &claims); err != nil || claims.Exp == 0 {
+		return time.Time{}, time.Time{}, false
+	}
+	if claims.Iat != 0 {
+		iat = time.Unix(int64(claims.Iat), 0)
+	}
+	return time.Unix(int64(claims.Exp), 0), iat, true
+}
+
 func retryTokenRequest[T any](ctx context.Context, f func(context.Context) (T, error)) (T, error) {
 	return retryhandler.WithRetryIf(ctx, nil, f, func(err error) bool {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {

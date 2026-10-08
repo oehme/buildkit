@@ -1,6 +1,7 @@
 package resolver
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -197,4 +198,62 @@ func TestBearerAuthFallsBackToAnonymousTokenWithoutSession(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("expected anonymous token request")
 	}
+}
+
+func jwtWithClaims(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	dt, err := json.Marshal(claims)
+	require.NoError(t, err)
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+	return header + "." + base64.RawURLEncoding.EncodeToString(dt) + ".signature"
+}
+
+func TestTokenLifetime(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	issued := now.Add(-10 * time.Second)
+
+	t.Run("jwt claim wins over a declared lifetime", func(t *testing.T) {
+		at, lifetime := tokenLifetime(jwtWithClaims(t, map[string]any{"exp": issued.Add(time.Hour).Unix()}), issued, 60)
+		require.Equal(t, issued, at)
+		require.Equal(t, int(time.Hour.Seconds()), lifetime)
+	})
+
+	t.Run("opaque token uses the declared lifetime", func(t *testing.T) {
+		at, lifetime := tokenLifetime("not-a-jwt", issued, 300)
+		require.Equal(t, issued, at)
+		require.Equal(t, 300, lifetime)
+	})
+
+	t.Run("jwt claims", func(t *testing.T) {
+		token := jwtWithClaims(t, map[string]any{"iat": issued.Unix(), "exp": issued.Add(3 * time.Hour).Unix()})
+		at, lifetime := tokenLifetime(token, time.Time{}, 0)
+		require.Equal(t, issued, at)
+		require.Equal(t, int((3 * time.Hour).Seconds()), lifetime)
+	})
+
+	t.Run("jwt expiry with issue time from response", func(t *testing.T) {
+		token := jwtWithClaims(t, map[string]any{"exp": issued.Add(time.Hour).Unix()})
+		at, lifetime := tokenLifetime(token, issued, 0)
+		require.Equal(t, issued, at)
+		require.Equal(t, int(time.Hour.Seconds()), lifetime)
+	})
+
+	t.Run("jwt expiry without issue time", func(t *testing.T) {
+		token := jwtWithClaims(t, map[string]any{"exp": now.Add(time.Hour).Unix()})
+		at, lifetime := tokenLifetime(token, time.Time{}, 0)
+		require.False(t, at.IsZero())
+		require.InDelta(t, time.Hour.Seconds(), lifetime, 5)
+	})
+
+	t.Run("expired jwt falls back to default", func(t *testing.T) {
+		token := jwtWithClaims(t, map[string]any{"exp": now.Add(-time.Hour).Unix()})
+		_, lifetime := tokenLifetime(token, time.Time{}, 0)
+		require.Equal(t, defaultExpiration, lifetime)
+	})
+
+	t.Run("opaque token falls back to default", func(t *testing.T) {
+		at, lifetime := tokenLifetime("not-a-jwt", time.Time{}, 0)
+		require.False(t, at.IsZero())
+		require.Equal(t, defaultExpiration, lifetime)
+	})
 }
