@@ -40,6 +40,8 @@ type llbBridge struct {
 	resolveCacheImporterFuncs map[string]remotecache.ResolveCacheImporterFunc
 	cms                       map[string]solver.CacheManager
 	cmsMu                     sync.Mutex
+	importCtx                 context.Context
+	cancelImports             context.CancelCauseFunc
 	sm                        *session.Manager
 	provenanceStore           *provenanceStore
 	proxyNetwork              bool
@@ -100,48 +102,9 @@ func (b *llbBridge) loadResult(ctx context.Context, def *pb.Definition, cacheImp
 		}
 		polEngine = sourcepolicy.NewEngine(pol)
 	}
-	var cms []solver.CacheManager
-	for _, im := range cacheImports {
-		cmID, err := cmKey(im)
-		if err != nil {
-			return nil, err
-		}
-		b.cmsMu.Lock()
-		var cm solver.CacheManager
-		if prevCm, ok := b.cms[cmID]; !ok {
-			func(cmID string, im gw.CacheOptionsEntry) {
-				cm = newLazyCacheManager(cmID, func() (solver.CacheManager, error) {
-					var cmNew solver.CacheManager
-					if err := inBuilderContext(context.WithoutCancel(ctx), b.builder, "importing cache manifest from "+cmID, "", func(ctx context.Context, jobCtx solver.JobContext) (err error) {
-						span, ctx := tracing.StartSpan(ctx, "importing cache manifest from "+cmID)
-						defer func() { tracing.FinishWithError(span, err) }()
-						resolveCI, ok := b.resolveCacheImporterFuncs[im.Type]
-						if !ok {
-							return errors.Errorf("unknown cache importer: %s", im.Type)
-						}
-						var g session.Group
-						if jobCtx != nil {
-							g = jobCtx.Session()
-						}
-						ci, desc, err := resolveCI(ctx, g, im.Attrs)
-						if err != nil {
-							return errors.Wrapf(err, "failed to configure %v cache importer", im.Type)
-						}
-						cmNew, err = ci.Resolve(ctx, desc, cmID, w)
-						return err
-					}); err != nil {
-						bklog.G(ctx).Debugf("error while importing cache manifest from cmId=%s: %v", cmID, err)
-						return nil, err
-					}
-					return cmNew, nil
-				})
-			}(cmID, im)
-			b.cms[cmID] = cm
-		} else {
-			cm = prevCm
-		}
-		cms = append(cms, cm)
-		b.cmsMu.Unlock()
+	cms, err := b.cacheManagers(ctx, w, cacheImports)
+	if err != nil {
+		return nil, err
 	}
 	dpc := &detectPrunedCacheID{}
 
@@ -163,6 +126,96 @@ func (b *llbBridge) loadResult(ctx context.Context, def *pb.Definition, cacheImp
 		return nil, err
 	}
 	return res, nil
+}
+
+// startCacheImports begins importing the given cache manifests in the
+// background, so that they are ready by the time a build definition refers
+// to them.
+func (b *llbBridge) startCacheImports(ctx context.Context, cacheImports []gw.CacheOptionsEntry) error {
+	if len(cacheImports) == 0 {
+		return nil
+	}
+	w, err := b.resolveWorker()
+	if err != nil {
+		return err
+	}
+	_, err = b.cacheManagers(ctx, w, cacheImports)
+	return err
+}
+
+// cacheManagers returns a cache manager per import. Each manifest is imported
+// once per build, in the background, and shared by all definitions that refer
+// to it.
+func (b *llbBridge) cacheManagers(ctx context.Context, w worker.Worker, cacheImports []gw.CacheOptionsEntry) ([]solver.CacheManager, error) {
+	cms := make([]solver.CacheManager, 0, len(cacheImports))
+	for _, im := range cacheImports {
+		cmID, err := cmKey(im)
+		if err != nil {
+			return nil, err
+		}
+		cms = append(cms, b.cacheManager(ctx, w, cmID, im))
+	}
+	return cms, nil
+}
+
+var errCacheImportAbandoned = errors.New("cache import abandoned, the build completed without needing it")
+
+// cancelCacheImports stops importing cache manifests that are still loading.
+// It is called once the build result is known and no step can consult them
+// anymore.
+func (b *llbBridge) cancelCacheImports() {
+	b.cmsMu.Lock()
+	defer b.cmsMu.Unlock()
+	if b.cancelImports != nil {
+		b.cancelImports(errCacheImportAbandoned)
+	}
+}
+
+func (b *llbBridge) cacheManager(ctx context.Context, w worker.Worker, cmID string, im gw.CacheOptionsEntry) solver.CacheManager {
+	b.cmsMu.Lock()
+	defer b.cmsMu.Unlock()
+	if cm, ok := b.cms[cmID]; ok {
+		return cm
+	}
+	if b.importCtx == nil {
+		b.importCtx, b.cancelImports = context.WithCancelCause(context.WithoutCancel(ctx))
+	}
+	importCtx := b.importCtx
+	cm := newLazyCacheManager(cmID, func() (solver.CacheManager, error) {
+		var cmNew solver.CacheManager
+		if err := inBuilderContext(importCtx, b.builder, "importing cache manifest from "+cmID, "", func(ctx context.Context, jobCtx solver.JobContext) (err error) {
+			span, ctx := tracing.StartSpan(ctx, "importing cache manifest from "+cmID)
+			defer func() {
+				if errors.Is(context.Cause(ctx), errCacheImportAbandoned) {
+					err = nil
+				}
+				tracing.FinishWithError(span, err)
+			}()
+			resolveCI, ok := b.resolveCacheImporterFuncs[im.Type]
+			if !ok {
+				return errors.Errorf("unknown cache importer: %s", im.Type)
+			}
+			var g session.Group
+			if jobCtx != nil {
+				g = jobCtx.Session()
+			}
+			ci, desc, err := resolveCI(ctx, g, im.Attrs)
+			if err != nil {
+				return errors.Wrapf(err, "failed to configure %v cache importer", im.Type)
+			}
+			cmNew, err = ci.Resolve(ctx, desc, cmID, w)
+			return err
+		}); err != nil {
+			bklog.G(ctx).Debugf("error while importing cache manifest from cmId=%s: %v", cmID, err)
+			return nil, err
+		}
+		if cmNew == nil {
+			return nil, errCacheImportAbandoned
+		}
+		return cmNew, nil
+	})
+	b.cms[cmID] = cm
+	return cm
 }
 
 func (b *llbBridge) policy(engine *sourcepolicy.Engine) SourcePolicyEvaluator {

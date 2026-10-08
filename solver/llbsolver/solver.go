@@ -267,6 +267,9 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 
 	br := s.bridge(j, withBridgeProxyNetwork(proxyNetwork || s.proxyNetwork))
 	defer br.releaseProvenanceRefs()
+	if err := br.startCacheImports(ctx, req.CacheImports); err != nil {
+		return nil, err
+	}
 	rootReq := req.Clone()
 	br.rootReq = &rootReq
 	var fwd gateway.LLBBridgeForwarder
@@ -299,6 +302,7 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 			}
 		}()
 	}
+	defer br.cancelCacheImports()
 
 	if fwd != nil {
 		var err error
@@ -365,6 +369,7 @@ func (s *Solver) Solve(ctx context.Context, id string, sessionID string, req fro
 	if err != nil {
 		return nil, err
 	}
+	br.cancelCacheImports()
 	inp, err := result.ConvertResult(cached, func(res solver.CachedResult) (cache.ImmutableRef, error) {
 		workerRef, ok := res.Sys().(*worker.WorkerRef)
 		if !ok {
