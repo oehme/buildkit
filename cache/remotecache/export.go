@@ -237,12 +237,8 @@ func (ce *contentCacheExporter) Finalize(ctx context.Context) (map[string]string
 	if err != nil {
 		return nil, err
 	}
-	dgst := digest.FromBytes(dt)
-	desc := ocispecs.Descriptor{
-		Digest:    dgst,
-		Size:      int64(len(dt)),
-		MediaType: cacheimporttypes.CacheConfigMediaTypeV0,
-	}
+	desc := configDescriptor(dt, ce.oci)
+	dgst := desc.Digest
 	configDone := progress.OneOff(ctx, fmt.Sprintf("writing config %s", dgst))
 	if err := content.WriteBlob(ctx, ce.ingester, dgst.String(), bytes.NewReader(dt), desc); err != nil {
 		err = withRemoteCacheErrorDetails(err)
@@ -281,6 +277,26 @@ func (ce *contentCacheExporter) Finalize(ctx context.Context) (map[string]string
 	mfstDone(nil)
 
 	return res, nil
+}
+
+// maxEmbeddedConfigSize bounds the cache configs that are embedded in their
+// descriptor. Importers reject manifests above 1 MiB, and embedding grows the
+// manifest by a third more than the size of the config.
+const maxEmbeddedConfigSize = 256 << 10
+
+// configDescriptor describes the cache config blob. With OCI media types a
+// small config is embedded in the descriptor, so that importers can read it
+// without requesting the blob from the registry.
+func configDescriptor(dt []byte, oci bool) ocispecs.Descriptor {
+	desc := ocispecs.Descriptor{
+		Digest:    digest.FromBytes(dt),
+		Size:      int64(len(dt)),
+		MediaType: cacheimporttypes.CacheConfigMediaTypeV0,
+	}
+	if oci && len(dt) <= maxEmbeddedConfigSize {
+		desc.Data = dt
+	}
+	return desc
 }
 
 func withRemoteCacheErrorDetails(err error) error {

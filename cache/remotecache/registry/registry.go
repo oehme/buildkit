@@ -3,16 +3,20 @@ package registry
 import (
 	"context"
 	"maps"
+	"net/http"
 	"strconv"
 
 	"github.com/containerd/containerd/v2/core/content"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
+	remoteserrors "github.com/containerd/containerd/v2/core/remotes/errors"
 	"github.com/containerd/containerd/v2/core/snapshots"
 	"github.com/containerd/containerd/v2/pkg/snapshotters"
+	cerrdefs "github.com/containerd/errdefs"
 
 	"github.com/distribution/reference"
 	"github.com/moby/buildkit/cache/remotecache"
 	"github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/compression"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/estargz"
@@ -118,7 +122,7 @@ func ResolveCacheImporterFunc(sm *session.Manager, cs content.Store, hosts docke
 
 		scope, hosts := registryConfig(hosts, ref, resolver.ScopeType{}, insecure)
 		remote := resolver.DefaultPool.GetResolver(hosts, refString, scope, sm, g)
-		xref, desc, err := remote.Resolve(ctx, refString)
+		xref, desc, err := resolveCacheManifest(ctx, remote, refString)
 		if err != nil {
 			return nil, ocispecs.Descriptor{}, err
 		}
@@ -130,6 +134,22 @@ func ResolveCacheImporterFunc(sm *session.Manager, cs content.Store, hosts docke
 		}
 		return remotecache.NewImporter(src), desc, nil
 	}
+}
+
+// resolveCacheManifest fetches the cache manifest together with resolving the
+// reference. Registries that do not serve it that way are resolved and fetched
+// in two requests as before.
+func resolveCacheManifest(ctx context.Context, remote *resolver.Resolver, ref string) (string, ocispecs.Descriptor, error) {
+	xref, desc, err := remote.FetchManifest(ctx, ref)
+	if err == nil {
+		return xref, desc, nil
+	}
+	var statusErr remoteserrors.ErrUnexpectedStatus
+	if errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusNotFound {
+		return "", ocispecs.Descriptor{}, errors.Wrapf(cerrdefs.ErrNotFound, "%s", ref)
+	}
+	bklog.G(ctx).Debugf("fetching cache manifest %s in a single request failed, resolving instead: %v", ref, err)
+	return remote.Resolve(ctx, ref)
 }
 
 type registryCacheProvider struct {
