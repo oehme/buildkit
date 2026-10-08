@@ -1050,6 +1050,14 @@ func (c cacheWithCacheOpts) Records(ctx context.Context, ck *CacheKey) ([]*Cache
 	return c.CacheManager.Records(withAncestorCacheOpts(ctx, c.st), ck)
 }
 
+func (c cacheWithCacheOpts) QueryMain(inp []CacheKeyWithSelector, inputIndex Index, dgst digest.Digest, outputIndex Index) ([]*CacheKey, bool, error) {
+	if mq, ok := c.CacheManager.(mainCacheQuerier); ok {
+		return mq.QueryMain(inp, inputIndex, dgst, outputIndex)
+	}
+	keys, err := c.CacheManager.Query(inp, inputIndex, dgst, outputIndex)
+	return keys, true, err
+}
+
 func (s *sharedOp) LoadCache(ctx context.Context, rec *CacheRecord) (Result, func(context.Context) context.Context, error) {
 	ctx = progress.WithProgress(ctx, s.st.mpw)
 	if s.st.mspan.Span != nil {

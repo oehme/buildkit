@@ -357,3 +357,12 @@ func debugSchedulerDepDelivery(e *edge, dep *dep, state *edgeState) {
 			Debug("dep delivery: edgeState keys vs result keys")
 	}
 }
+
+func debugSchedulerProbeAllCaches(e *edge) {
+	if e.debug {
+		bklog.G(context.TODO()).
+			WithField("vtx", e.edge.Vertex.Digest()).
+			WithField("vtx_name", e.edge.Vertex.Name()).
+			Debug("consulting imported caches")
+	}
+}

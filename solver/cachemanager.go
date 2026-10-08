@@ -448,10 +448,19 @@ func (c *cacheManager) getIDFromDeps(k *CacheKey) string {
 	return identity.NewID()
 }
 
+// randomDigestPrefix marks cache map digests that are unique to a single build,
+// such as those of local sources. Keys derived from them never match any
+// cache that was not populated during the same build.
+const randomDigestPrefix = "random:"
+
+func isRandomDigest(dgst digest.Digest) bool {
+	return strings.HasPrefix(dgst.String(), randomDigestPrefix)
+}
+
 func rootKey(dgst digest.Digest, output Index) digest.Digest {
 	out, _ := cachedigest.FromBytes(fmt.Appendf(nil, "%s@%d", dgst, output), cachedigest.TypeString)
-	if strings.HasPrefix(dgst.String(), "random:") {
-		return digest.Digest("random:" + dgst.Encoded())
+	if isRandomDigest(dgst) {
+		return digest.Digest(randomDigestPrefix + dgst.Encoded())
 	}
 	return out
 }

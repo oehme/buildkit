@@ -3814,6 +3814,7 @@ type vtxOpt struct {
 	selectors        map[int]digest.Digest
 	cacheSource      CacheManager
 	ignoreCache      bool
+	randomCacheKey   bool
 }
 
 func vtx(opt vtxOpt) *vertex {
@@ -3994,6 +3995,9 @@ func (v *vertex) makeCacheMap() *CacheMap {
 	}
 	for i, dgst := range v.opt.selectors {
 		m.Deps[i].Selector = dgst
+	}
+	if v.opt.randomCacheKey {
+		m.Digest = digest.Digest(randomDigestPrefix + m.Digest.Encoded())
 	}
 	return m
 }

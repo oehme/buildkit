@@ -2,6 +2,7 @@ package solver
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,6 +59,8 @@ type edge struct {
 	keyMap             map[string]struct{}
 
 	noCacheMatchPossible      bool
+	probedMainCacheOnly       bool
+	probeAllCaches            bool
 	allDepsCompletedCacheFast bool
 	allDepsCompletedCacheSlow bool
 	allDepsStateCacheSlow     bool
@@ -200,7 +203,7 @@ func (e *edge) probeCache(d *dep, depKeys []CacheKeyWithSelector) bool {
 	if e.op.IgnoreCache() {
 		return false
 	}
-	keys, err := e.op.Cache().Query(depKeys, d.index, e.cacheMap.Digest, e.edge.Index)
+	keys, err := e.queryCache(depKeys, d.index, e.cacheMap.Digest, e.edge.Index)
 	if err != nil {
 		e.err = errors.Wrap(err, "error on cache query")
 	}
@@ -213,6 +216,88 @@ func (e *edge) probeCache(d *dep, depKeys []CacheKeyWithSelector) bool {
 		}
 	}
 	return found
+}
+
+// queryCache answers probes from the main cache alone until that fails for a
+// probe that an imported cache could match, see consultImportedCaches.
+func (e *edge) queryCache(inp []CacheKeyWithSelector, inputIndex Index, dgst digest.Digest, outputIndex Index) ([]*CacheKey, error) {
+	cm := e.op.Cache()
+	mq, ok := cm.(mainCacheQuerier)
+	if !ok {
+		return cm.Query(inp, inputIndex, dgst, outputIndex)
+	}
+	importable := !e.op.IgnoreCache() && canMatchImportedCache(inp, dgst)
+	if importable && e.probeAllCaches {
+		return cm.Query(inp, inputIndex, dgst, outputIndex)
+	}
+	keys, final, err := mq.QueryMain(inp, inputIndex, dgst, outputIndex)
+	if err != nil || final || !importable {
+		return keys, err
+	}
+	if len(keys) > 0 {
+		e.probedMainCacheOnly = true
+		return keys, nil
+	}
+	e.consultImportedCaches()
+	return cm.Query(inp, inputIndex, dgst, outputIndex)
+}
+
+// consultImportedCaches switches the edge from probing the main cache alone to
+// probing all caches. Earlier probes are repeated so that keys from imported
+// caches can be intersected across dependencies. Besides a probe that the main
+// cache can not answer, this happens right before an edge would execute, as
+// the main cache may hold the keys of a result that it no longer has.
+func (e *edge) consultImportedCaches() {
+	if e.probeAllCaches {
+		return
+	}
+	e.probeAllCaches = true
+	debugSchedulerProbeAllCaches(e)
+	if !e.probedMainCacheOnly {
+		return
+	}
+	for i, dep := range e.deps {
+		e.probeCache(dep, withSelector(dep.keys, e.cacheMap.Deps[i].Selector))
+		if dep.slowCacheKey != nil && e.probeCache(dep, []CacheKeyWithSelector{{CacheKey: *dep.slowCacheKey}}) {
+			dep.slowCacheFoundKey = true
+		}
+	}
+}
+
+// mainCacheMatchesDoNotIntersect reports whether the main cache matched every
+// dependency, but only with results produced from other combinations of
+// dependencies, so that an imported cache may still hold this combination.
+func (e *edge) mainCacheMatchesDoNotIntersect() bool {
+	return len(e.deps) > 0 && len(e.keys) == 0 && e.allDepsCompletedCacheFast && e.mainCacheMayHideMatch()
+}
+
+// mainCacheMayHideMatch reports whether probes answered by the main cache alone
+// could have hidden a match in an imported cache. That requires every
+// dependency to have a matching key, otherwise no cache can match the edge.
+func (e *edge) mainCacheMayHideMatch() bool {
+	if !e.probedMainCacheOnly || e.probeAllCaches || e.noCacheMatchPossible {
+		return false
+	}
+	for _, dep := range e.deps {
+		if len(dep.keyMap) == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// canMatchImportedCache reports whether a cache query could be answered by an
+// imported cache. Random keys are unique to the current build.
+func canMatchImportedCache(inp []CacheKeyWithSelector, dgst digest.Digest) bool {
+	if len(inp) == 0 {
+		return !isRandomDigest(dgst)
+	}
+	for _, k := range inp {
+		if !strings.HasPrefix(k.CacheKey.ID, randomDigestPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // checkDepMatchPossible checks if any cache matches are possible past this point
@@ -536,6 +621,12 @@ func (e *edge) recalcCurrentState() {
 		e.allDepsStateCacheSlow = e.cacheMapDone && allDepsStateCacheSlow
 		e.allDepsCompleted = e.cacheMapDone && allDepsCompleted
 
+		if e.mainCacheMatchesDoNotIntersect() {
+			e.consultImportedCaches()
+			e.recalcCurrentState()
+			return
+		}
+
 		if e.allDepsStateCacheSlow && len(e.cacheRecords) > 0 && e.state == edgeStatusCacheFast {
 			openKeys := map[string]struct{}{}
 			for _, dep := range e.deps {
@@ -583,7 +674,7 @@ func (e *edge) processCacheMapReq() {
 	if len(e.deps) == 0 {
 		e.cacheMapDigests = append(e.cacheMapDigests, e.cacheMap.Digest)
 		if !e.op.IgnoreCache() {
-			keys, err := e.op.Cache().Query(nil, 0, e.cacheMap.Digest, e.edge.Index)
+			keys, err := e.queryCache(nil, 0, e.cacheMap.Digest, e.edge.Index)
 			if err != nil {
 				bklog.G(context.TODO()).Error(errors.Wrap(err, "invalid query response")) // make the build fail for this error
 			} else {
@@ -714,10 +805,12 @@ func (e *edge) processDepSlowCacheReq(index int, dep *dep) {
 			for _, dk := range dep.result.CacheKeys() {
 				defKeys = append(defKeys, CacheKeyWithSelector{CacheKey: dk, Selector: e.cacheMap.Deps[index].Selector})
 			}
-			dep.slowCacheFoundKey = e.probeCache(dep, []CacheKeyWithSelector{slowKeyExp})
+			if e.probeCache(dep, []CacheKeyWithSelector{slowKeyExp}) {
+				dep.slowCacheFoundKey = true
+			}
 
 			// connect def key to slow key
-			e.op.Cache().Query(append(defKeys, slowKeyExp), dep.index, e.cacheMap.Digest, e.edge.Index)
+			e.queryCache(append(defKeys, slowKeyExp), dep.index, e.cacheMap.Digest, e.edge.Index)
 		}
 
 		dep.slowCacheComplete = true
@@ -934,6 +1027,12 @@ func (e *edge) execIfPossible(f *pipeFactory) bool {
 		return true
 	} else if e.allDepsCompleted {
 		if e.keysDidChange {
+			e.postpone(f)
+			return true
+		}
+		if e.mainCacheMayHideMatch() {
+			e.consultImportedCaches()
+			e.recalcCurrentState()
 			e.postpone(f)
 			return true
 		}

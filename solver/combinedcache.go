@@ -11,15 +11,30 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// mainCacheQuerier is implemented by cache managers that combine a main cache
+// with imported caches that may still be loading. QueryMain consults the main
+// cache alone and reports whether its answer is final, which is the case when
+// there are no imported caches.
+type mainCacheQuerier interface {
+	QueryMain(inp []CacheKeyWithSelector, inputIndex Index, dgst digest.Digest, outputIndex Index) (keys []*CacheKey, final bool, err error)
+}
+
 func NewCombinedCacheManager(cms []CacheManager, main CacheManager) CacheManager {
-	return &combinedCacheManager{cms: cms, main: main}
+	cm := &combinedCacheManager{cms: cms, main: main}
+	for _, c := range cms {
+		if c != main {
+			cm.hasImportedCaches = true
+		}
+	}
+	return cm
 }
 
 type combinedCacheManager struct {
-	cms    []CacheManager
-	main   CacheManager
-	id     string
-	idOnce sync.Once
+	cms               []CacheManager
+	main              CacheManager
+	hasImportedCaches bool
+	id                string
+	idOnce            sync.Once
 }
 
 func (cm *combinedCacheManager) ID() string {
@@ -43,6 +58,14 @@ func (cm *combinedCacheManager) ReleaseUnreferenced(ctx context.Context) error {
 		}(c)
 	}
 	return eg.Wait()
+}
+
+func (cm *combinedCacheManager) QueryMain(inp []CacheKeyWithSelector, inputIndex Index, dgst digest.Digest, outputIndex Index) ([]*CacheKey, bool, error) {
+	if cm.main == nil {
+		return nil, false, nil
+	}
+	keys, err := cm.main.Query(inp, inputIndex, dgst, outputIndex)
+	return keys, !cm.hasImportedCaches, err
 }
 
 func (cm *combinedCacheManager) Query(inp []CacheKeyWithSelector, inputIndex Index, dgst digest.Digest, outputIndex Index) ([]*CacheKey, error) {
